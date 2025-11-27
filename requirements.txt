@@ -1,0 +1,11 @@
+streamlit
+pillow
+pytesseract
+pdf2image
+pyzbar
+opencv-python-headless
+pandas
+openpyxl
+python-dateutil
+pandas
+pdfplumber
