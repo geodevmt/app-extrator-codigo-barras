@@ -1,3 +1,5 @@
+# Desenvolvido por: Paulo César Jr.
+#26/11/2025
 import streamlit as st
 import pandas as pd
 import pdfplumber
@@ -264,4 +266,5 @@ if uploaded_files:
             )
 else:
     # Estado inicial amigável
+
     st.info("👆 Selecione os arquivos PDF acima para começar a extração.")
