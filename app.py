@@ -7,71 +7,69 @@ import re
 import io
 from datetime import datetime
 
-# --- 1. CONFIGURAÇÃO DE UI (PROFISSIONAL) ---
+# --- 1. CONFIGURAÇÃO DE UI ---
 st.set_page_config(
-    page_title="Extrator de Códigos de Barras",
-    page_icon="💰",
+    page_title="Extrator de Boletos (Multi-Page)",
+    page_icon="📑",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Estilização CSS para dar acabamento corporativo
 st.markdown("""
     <style>
-    .main {
-        background-color: #f8f9fa;
-    }
-    .stMetric {
-        background-color: #ffffff;
-        padding: 15px;
-        border-radius: 10px;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        border: 1px solid #e9ecef;
-    }
-    .stButton>button {
-        width: 100%;
-        border-radius: 8px;
-        font-weight: bold;
-        height: 3.5em;
-    }
-    /* Destaque para o botão de download */
-    div[data-testid="stDownloadButton"] > button {
-        background-color: #2e7d32;
-        color: white;
-        border: none;
-    }
-    div[data-testid="stDownloadButton"] > button:hover {
-        background-color: #1b5e20;
-        color: white;
-    }
+    .main { background-color: #f8f9fa; }
+    .stMetric { background-color: #fff; border: 1px solid #e9ecef; border-radius: 8px; padding: 10px; }
+    .stButton>button { width: 100%; border-radius: 6px; height: 3em; font-weight: bold; }
+    div[data-testid="stDownloadButton"] > button { background-color: #2e7d32; color: white; border: none; }
+    div[data-testid="stDownloadButton"] > button:hover { background-color: #1b5e20; color: white; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. LÓGICA DE EXTRAÇÃO (MOTOR V3.2 - MULTI-PATTERN) ---
-
-def extrair_texto_pdf(file):
-    """Extrai texto mantendo layout visual"""
-    texto_completo = ""
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            texto_completo += page.extract_text() or ""
-    return texto_completo
+# --- 2. MOTOR DE EXTRAÇÃO ESTRUTURAL (V4.0) ---
 
 def limpar_string_numerica(s):
     if not s: return None
     return re.sub(r'[^0-9]', '', s)
 
-def buscar_padroes(texto):
-    """Motor de extração: Suporte a múltiplos formatos de boletos bancários."""
+def buscar_padroes_na_pagina(texto, numero_pagina, nome_arquivo):
+    """
+    Analisa UMA única página por vez.
+    Retorna um dicionário de dados se achar algo relevante, ou dados vazios.
+    """
     dados = {
+        "Arquivo_Origem": f"{nome_arquivo} (Pág {numero_pagina})",
         "Beneficiario_Pagador_Doc": None,
         "Data_Vencimento": None,
         "Valor": 0.0,
-        "Codigo_Barras": None,
-        "Nome_Arquivo": None
+        "Codigo_Barras": None
     }
 
-    # --- A. DADOS GERAIS ---
+    # --- A. CÓDIGO DE BARRAS (Prioridade Máxima) ---
+    # Se não tiver código de barras na página, provavelmente é capa ou extrato.
+    
+    padroes_barras = [
+        # 1. Bancário Padrão (47 dígitos com espaços/pontos)
+        r'(\d{5}[\.]?\d{5}[\s\.]+\d{5}[\.]?\d{6}[\s\.]+\d{5}[\.]?\d{6}[\s\.]+\d[\s\.]+\d{14})',
+        # 2. Bancário Compacto/Alternativo (Ex: Santander/Estácio - pontos deslocados)
+        r'(\d{9,10}[\.]?\d{1,2}[\s\.]+\d{10,11}[\.]?\d{1,2}[\s\.]+\d{10,11}[\.]?\d{1,2}[\s\.]+\d[\s\.]+\d{14})',
+        # 3. Arrecadação/Concessionárias (4 blocos de 12 dígitos - Ex: Detran/Luz)
+        r'(\d{11,12}[-\s]?\d{1}[\s\.]+\d{11,12}[-\s]?\d{1}[\s\.]+\d{11,12}[-\s]?\d{1}[\s\.]+\d{11,12}[-\s]?\d{1})'
+    ]
+
+    linha_crua = None
+    for p in padroes_barras:
+        match = re.search(p, texto)
+        if match:
+            linha_crua = match.group(0)
+            break
+    
+    if linha_crua:
+        dados["Codigo_Barras"] = limpar_string_numerica(linha_crua)
+    else:
+        # Se não achou código de barras, marcamos para descarte posterior
+        return None 
+
+    # --- B. DADOS COMPLEMENTARES (Só busca se achou o código) ---
     
     # CNPJ/CPF
     cnpj = re.search(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}', texto)
@@ -80,69 +78,44 @@ def buscar_padroes(texto):
     elif cpf: dados["Beneficiario_Pagador_Doc"] = cpf.group()
 
     # Data (Janela 2020-2030)
-    datas_encontradas = re.findall(r'(\d{2}/\d{2}/\d{4})', texto)
+    datas = re.findall(r'(\d{2}/\d{2}/\d{4})', texto)
     datas_validas = []
-    if datas_encontradas:
-        for d in datas_encontradas:
+    if datas:
+        for d in datas:
             try:
-                dt_obj = datetime.strptime(d, "%d/%m/%Y")
-                if 2020 <= dt_obj.year <= 2030:
-                    datas_validas.append(dt_obj)
+                dt = datetime.strptime(d, "%d/%m/%Y")
+                if 2020 <= dt.year <= 2030: datas_validas.append(dt)
             except: continue
     if datas_validas:
+        # Geralmente o vencimento é a maior data futura
         dados["Data_Vencimento"] = max(datas_validas).strftime("%d/%m/%Y")
 
     # Valor
+    # Tenta achar valor monetário explícito (R$)
     valores = re.findall(r'(?:R\$\s?|Valor\s?)([\d\.]+,\d{2})', texto, re.IGNORECASE)
     if not valores:
+        # Tenta achar formato monetário isolado
         valores = re.findall(r'(?:\s|^)(\d{1,3}(?:\.\d{3})*,\d{2})(?:\s|$)', texto)
     
     if valores:
-        try:
-            valores_float = []
-            for v in valores:
+        valores_float = []
+        for v in valores:
+            try:
                 if isinstance(v, tuple): v = v[0]
                 v_clean = v.replace('.', '').replace(',', '.')
                 valores_float.append(float(v_clean))
-            max_val = max(valores_float)
-            if max_val > 0: dados["Valor"] = max_val
-        except: pass
-
-    # --- B. CÓDIGO DE BARRAS (LÓGICA MULTI-PADRÃO) ---
-    
-    # Lista de padrões aceitos. O sistema tentará um por um.
-    padroes = []
-
-    # 1. Padrão Bancário Clássico (FEBRABAN)
-    # Ex: 12345.12345 12345.123456 12345.123456 1 12345678901234
-    padroes.append(r'(\d{5}[\.]?\d{5}[\s\.]+\d{5}[\.]?\d{6}[\s\.]+\d{5}[\.]?\d{6}[\s\.]+\d[\s\.]+\d{14})')
-    
-    # 2. Padrão Bancário Alternativo (Ex: Santander/Estácio)
-    # Ex: 033990067.2 4121010110.5 2444060101.1 5 ...
-    # Estrutura: Bloco1(9.1) Bloco2(10.1) Bloco3(10.1) Digito(1) Valor(14)
-    # A regex abaixo permite o ponto mais para o final do bloco
-    padroes.append(r'(\d{9,10}[\.]?\d{1,2}[\s\.]+\d{10,11}[\.]?\d{1,2}[\s\.]+\d{10,11}[\.]?\d{1,2}[\s\.]+\d[\s\.]+\d{14})')
-
-    # 3. Padrão Arrecadação (Concessionárias) - 4 blocos
-    padroes.append(r'(\d{11,12}[-\s]?\d{1}[\s\.]+\d{11,12}[-\s]?\d{1}[\s\.]+\d{11,12}[-\s]?\d{1}[\s\.]+\d{11,12}[-\s]?\d{1})')
-
-    linha_encontrada = None
-
-    for regex in padroes:
-        match = re.search(regex, texto)
-        if match:
-            linha_encontrada = match.group(0)
-            break # Parar no primeiro padrão que funcionar
-    
-    if linha_encontrada:
-        dados["Codigo_Barras"] = limpar_string_numerica(linha_encontrada)
+            except: continue
+        
+        if valores_float:
+            dados["Valor"] = max(valores_float)
 
     return dados
 
-# --- 3. BARRA LATERAL (SIDEBAR) ---
+# --- 3. FRONTEND ---
+
 with st.sidebar:
-    st.header("Fluxo de Trabalho")
-    st.markdown("""
+    st.header("Fluxo V4.0 (Multi-Page)")
+    st.info("""
     **1. Upload:** Arraste seus arquivos PDF.
     
     **2. Processamento:** O sistema identifica Cód. Barras, Valores e Datas.
@@ -152,119 +125,100 @@ with st.sidebar:
     **4. Ajuste:** Edite a tabela se necessário.
     
     **5. Exportação:** Baixe o Excel final.
+    """"""
+    **Novidade:** Agora o sistema lê arquivos PDF com múltiplas páginas (ex: 1 arquivo com 50 boletos).
+    
+    Ele verifica página por página e ignora capas ou extratos que não tenham código de barras.
     """)
-    
-    st.info("💡 **Dica:** O sistema foi ajustado para ignorar datas próximas ao código de barras.")
-    
-    st.divider()
-    st.caption("v3.2 | Multi-Pattern Support")
 
-# --- 4. ÁREA PRINCIPAL ---
-
-st.title("💰 Extrator de Código de Barras Inteligente")
+st.title("💰 Extrator de Código de Barras de Boletos")
+st.markdown("### Processamento de Arquivos Individuais e/ou Multipáginas")
 
 uploaded_files = st.file_uploader(
-    "Arraste os arquivos PDF do lote aqui:", 
+    "Arraste arquivos PDF (Individuais ou com Múltiplos Boletos)", 
     type=['pdf'], 
     accept_multiple_files=True
 )
 
 if uploaded_files:
-    lista_dados = []
+    lista_final = []
     
-    # Status container animado
-    with st.status("Processando documentos...", expanded=True) as status:
-        progresso_bar = st.progress(0)
-        st.write("Iniciando leitura rigorosa dos arquivos...")
+    with st.status("Analisando páginas...", expanded=True) as status:
+        progresso_geral = st.progress(0)
         
-        for i, file in enumerate(uploaded_files):
+        for i_file, file in enumerate(uploaded_files):
             try:
-                texto = extrair_texto_pdf(file)
-                dados = buscar_padroes(texto)
-                dados['Nome_Arquivo'] = file.name
-                lista_dados.append(dados)
-            except Exception as e:
-                st.error(f"Erro no arquivo {file.name}")
-            
-            progresso_bar.progress((i + 1) / len(uploaded_files))
-        
-        status.update(label="✅ Processamento Finalizado!", state="complete", expanded=False)
+                # ABRE O PDF
+                with pdfplumber.open(file) as pdf:
+                    total_paginas = len(pdf.pages)
+                    
+                    # ITERA SOBRE CADA PÁGINA INDIVIDUALMENTE
+                    for i_page, page in enumerate(pdf.pages):
+                        texto_pagina = page.extract_text() or ""
+                        
+                        # Processa a página
+                        resultado = buscar_padroes_na_pagina(texto_pagina, i_page + 1, file.name)
+                        
+                        # FILTRO INTELIGENTE: Só adiciona se achou código de barras
+                        if resultado and resultado["Codigo_Barras"]:
+                            lista_final.append(resultado)
+                        
+                        # Log discreto para debug visual se necessário
+                        # st.text(f"Lendo {file.name} - Pág {i_page+1}")
 
-    if lista_dados:
-        df = pd.DataFrame(lista_dados)
+            except Exception as e:
+                st.error(f"Erro ao ler {file.name}: {e}")
+            
+            progresso_geral.progress((i_file + 1) / len(uploaded_files))
         
-        # --- TRATAMENTO DE ERROS NA DATA ---
-        # Converte para datetime e trata erros silenciosamente (NaT)
+        status.update(label=f"Concluído! Encontrados {len(lista_final)} boletos válidos.", state="complete", expanded=False)
+
+    if lista_final:
+        df = pd.DataFrame(lista_final)
+        
+        # Converte Data
         df['Data_Vencimento'] = pd.to_datetime(df['Data_Vencimento'], format='%d/%m/%Y', errors='coerce')
 
-        # Ordenação de colunas
-        cols_order = ['Nome_Arquivo', 'Beneficiario_Pagador_Doc', 'Data_Vencimento', 'Valor', 'Codigo_Barras']
-        for c in cols_order:
+        # Ordena Colunas
+        cols = ['Arquivo_Origem', 'Beneficiario_Pagador_Doc', 'Data_Vencimento', 'Valor', 'Codigo_Barras']
+        for c in cols: 
             if c not in df.columns: df[c] = None
-        df = df[cols_order]
+        df = df[cols]
 
-        # --- DASHBOARD (KPIs) ---
+        # --- DASHBOARD ---
         st.divider()
-        st.subheader("📊 Resumo do Lote")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        valor_total = df['Valor'].sum()
-        qtd_boletos = len(df)
-        sem_barras = df['Codigo_Barras'].isna().sum()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Valor Total (R$)", f"R$ {df['Valor'].sum():,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        c2.metric("Boletos Detectados", len(df))
+        c3.metric("Arquivos Enviados", len(uploaded_files))
 
-        with col1:
-            st.metric("Valor Total do Lote", f"R$ {valor_total:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-        with col2:
-            st.metric("Quantidade de Boletos", qtd_boletos)
-        with col3:
-            st.metric("Boletos c/ Pendência", f"{sem_barras}", delta_color="inverse" if sem_barras > 0 else "normal")
-
-        # --- TABELA INTERATIVA ---
-        st.subheader("📝 Validação e Edição")
-        st.caption("Dê um duplo clique na célula para corrigir valores manualmente.")
-
+        # --- TABELA ---
+        st.subheader("Validação")
         df_editado = st.data_editor(
             df,
             num_rows="dynamic",
             use_container_width=True,
-            height=400,
             column_config={
-                "Nome_Arquivo": st.column_config.TextColumn("Arquivo", disabled=True),
-                "Beneficiario_Pagador_Doc": st.column_config.TextColumn("CNPJ/CPF", width="medium"),
-                "Data_Vencimento": st.column_config.DateColumn("Vencimento", format="DD/MM/YYYY"),
-                "Valor": st.column_config.NumberColumn(
-                    "Valor (R$)",
-                    format="R$ %.2f",
-                    min_value=0
-                ),
-                "Codigo_Barras": st.column_config.TextColumn(
-                    "Linha Digitável",
-                    help="Código para pagamento bancário",
-                    width="large",
-                    required=True
-                )
+                "Valor": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Data_Vencimento": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                "Codigo_Barras": st.column_config.TextColumn(width="large", required=True)
             }
         )
 
-        # --- EXPORTAÇÃO ---
-        st.divider()
-        col_esq, col_dir = st.columns([2, 1])
+        # --- DOWNLOAD ---
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df_editado.to_excel(writer, index=False, sheet_name='Boletos')
         
-        with col_dir:
-            # Preparar buffer Excel
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df_editado.to_excel(writer, index=False, sheet_name='Pagamentos')
-            
-            st.download_button(
-                label="📥 BAIXAR PLANILHA FINAL (.xlsx)",
-                data=output.getvalue(),
-                file_name=f"Lote_Boletos_{datetime.now().strftime('%Y%m%d')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
-            )
-else:
-    # Estado inicial amigável
+        st.download_button(
+            "📥 Baixar Planilha em Excel (.xlsx)",
+            data=output.getvalue(),
+            file_name="Boletos_Extraidos.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
+        )
+    else:
+        st.warning("Nenhum código de barras válido foi encontrado nos arquivos. Verifique se são boletos legíveis (não imagens).")
 
-    st.info("👆 Selecione os arquivos PDF acima para começar a extração.")
+else:
+    st.info("Aguardando upload...")
